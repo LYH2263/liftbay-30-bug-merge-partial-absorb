@@ -91,12 +91,12 @@ def merge_calls(body: MergeRequest, db: Session = Depends(get_db)):
         select(ElevatorCar).where(ElevatorCar.building_id == first.building_id)
     ).all()
     cars = [CarState(c.id, c.floor, c.direction, c.load, c.capacity) for c in car_rows]
+    if not can_merge_group(cars, total):
+        # 超容量整笔失败：不改人数、不删原单、不写回放，调用方负责回滚本请求的读取
+        raise HTTPException(409, "所有轿厢剩余容量均无法容纳合并后的人数")
     first.passengers = total
-    if len(tickets) > 2:
-        db.delete(tickets[1])
-    else:
-        for t in tickets[1:]:
-            db.delete(t)
+    for t in tickets[1:]:
+        db.delete(t)
     db.add(
         DispatchLog(
             call_id=first.id,

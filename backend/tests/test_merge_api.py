@@ -73,6 +73,93 @@ def test_merged_call_congestion_and_dispatch_load_match(client, db):
     assert client.get("/api/congestion").json() == []  # 派工后不再拥堵
 
 
+def test_merge_three_tickets_collapses_to_one_and_everything_agrees(client, db):
+    # 三笔同层同向（2+3+4=9）：必须全部并入首笔，不能只删其中一笔
+    b = Building(name="测试楼", floors=10)
+    db.add(b)
+    db.flush()
+    car = ElevatorCar(
+        building_id=b.id, label="T1", floor=1, direction="idle",
+        load=0, capacity=10,
+    )
+    db.add(car)
+    tickets = [
+        CallTicket(building_id=b.id, floor=3, direction="up", passengers=p, status="waiting")
+        for p in (2, 3, 4)
+    ]
+    db.add_all(tickets)
+    db.commit()
+    ids = [c.id for c in tickets]
+
+    resp = client.post("/api/calls/merge", json={"call_ids": ids})
+    assert resp.status_code == 200
+    assert resp.json()["passengers"] == 9
+
+    calls = client.get("/api/calls").json()
+    waiting = [c for c in calls if c["status"] == "waiting"]
+    assert len(waiting) == 1
+    assert waiting[0]["id"] == ids[0]
+    assert waiting[0]["passengers"] == 9
+
+    # 拥堵合计 == 合并后人数
+    assert client.get("/api/congestion").json() == [{"floor": 3, "passengers": 9}]
+
+    # 回放只有一条合并记录，且挂在保留下来的首笔上
+    logs = client.get("/api/replay").json()
+    merge_logs = [l for l in logs if "合并" in l["detail"]]
+    assert len(merge_logs) == 1
+    assert merge_logs[0]["call_id"] == ids[0]
+    assert "9 人" in merge_logs[0]["detail"]
+
+    # 派工一次加上 9 人，与拥堵口径一致
+    assert client.post("/api/dispatch", json={"call_id": ids[0]}).status_code == 200
+    t1 = next(c for c in client.get("/api/cars").json() if c["id"] == car.id)
+    assert t1["load"] == 9
+    assert client.get("/api/congestion").json() == []
+
+
+def test_failed_three_ticket_merge_keeps_all_originals(client, db):
+    # 三笔合并超容量时，三笔都必须原样保留（回归：旧实现 3 笔时只删第二笔）
+    b = Building(name="测试楼", floors=10)
+    db.add(b)
+    db.flush()
+    db.add(ElevatorCar(
+        building_id=b.id, label="T1", floor=1, direction="idle",
+        load=5, capacity=10,
+    ))
+    tickets = [
+        CallTicket(building_id=b.id, floor=3, direction="up", passengers=p, status="waiting")
+        for p in (2, 3, 4)
+    ]
+    db.add_all(tickets)
+    db.commit()
+    ids = [c.id for c in tickets]
+
+    assert client.post("/api/calls/merge", json={"call_ids": ids}).status_code == 409
+
+    calls = {c["id"]: c for c in client.get("/api/calls").json()}
+    for cid, pax in zip(ids, (2, 3, 4)):
+        assert cid in calls
+        assert calls[cid]["status"] == "waiting"
+        assert calls[cid]["passengers"] == pax
+
+
+def test_failed_merge_writes_no_log_and_dispatch_uses_original_passengers(client, db):
+    _, car, c1, c2 = _world(db, car_capacity=8, car_load=4)
+
+    assert client.post("/api/calls/merge", json={"call_ids": [c1.id, c2.id]}).status_code == 409
+    # 失败不留任何回放痕迹
+    assert client.get("/api/replay").json() == []
+    # 拥堵仍是原两笔合计
+    assert client.get("/api/congestion").json() == [{"floor": 3, "passengers": 5}]
+
+    # 再派工按原始人数（2）计，轿厢 4+2=6
+    resp = client.post("/api/dispatch", json={"call_id": c1.id})
+    assert resp.status_code == 200
+    db.expire_all()
+    assert db.get(ElevatorCar, car.id).load == 6
+
+
 def test_merge_rejects_cross_floor_or_direction(client, db):
     b = Building(name="测试楼", floors=10)
     db.add(b)
